@@ -1,0 +1,1 @@
+"""Thesis document format checker."""
