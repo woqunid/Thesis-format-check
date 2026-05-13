@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 from docx import Document
 from docx.document import Document as DocxDocument
@@ -13,6 +14,8 @@ BODY_SIZE_PT = 12
 ABSTRACT_TITLE_SIZE_PT = 18
 BODY_INDENT_PT = 24
 TABLE_FIGURE_TITLE_SIZE_PT = 10.5
+BODY_MIN_TEXT_LENGTH = 15
+HEADING_PATTERN = re.compile(r"^\d+(?:\.\d+){0,3}(?:□|\s+).+")
 
 
 def check_file(path: Path) -> list[Violation]:
@@ -34,11 +37,16 @@ def check_file(path: Path) -> list[Violation]:
 def check_document(document: DocxDocument) -> list[Violation]:
     violations: list[Violation] = []
     violations.extend(_check_sections(document))
+    in_body = False
     for index, paragraph in enumerate(document.paragraphs, 1):
         text = paragraph.text.strip()
         if not text:
             continue
-        violations.extend(_check_paragraph(index, paragraph, text))
+        if _is_toc_paragraph(paragraph):
+            continue
+        if _starts_body_section(text):
+            in_body = True
+        violations.extend(_check_paragraph(index, paragraph, text, in_body))
     return violations
 
 
@@ -53,8 +61,9 @@ def _check_sections(document: DocxDocument) -> list[Violation]:
     return violations
 
 
-def _check_paragraph(index: int, paragraph, text: str) -> list[Violation]:
-    if text.startswith("摘要"):
+def _check_paragraph(index: int, paragraph, text: str, in_body: bool) -> list[Violation]:
+    normalized = _normalized_label(text)
+    if normalized.startswith("摘要"):
         return _check_abstract_title(index, paragraph, text)
     if text.startswith("ABSTRACT"):
         return _check_english_abstract_title(index, paragraph, text)
@@ -64,9 +73,9 @@ def _check_paragraph(index: int, paragraph, text: str) -> list[Violation]:
         return _check_english_keywords(index, paragraph, text)
     if _is_figure_or_table_title(text):
         return _check_figure_table_title(index, paragraph, text)
-    if _is_heading(text):
+    if in_body and _is_heading(text):
         return _check_heading(index, paragraph, text)
-    if _is_body_text(text):
+    if in_body and _is_body_text(text):
         return _check_body(index, paragraph, text)
     return []
 
@@ -120,7 +129,7 @@ def _check_figure_table_title(index: int, paragraph, text: str) -> list[Violatio
 
 
 def _check_heading(index: int, paragraph, text: str) -> list[Violation]:
-    level = text.split("□", 1)[0].count(".") + 1
+    level = _heading_level(text)
     size = ABSTRACT_TITLE_SIZE_PT if level == 1 else 14 if level == 2 else BODY_SIZE_PT
     expected = _heading_expected(level)
     checks = [
@@ -145,21 +154,21 @@ def _check_body(index: int, paragraph, text: str) -> list[Violation]:
 
 
 def _font_violation(index: int, paragraph, text: str, problem: str, expected_font: str, expected: str) -> Violation | None:
-    current = _first_run_font(paragraph)
+    current = _best_run_font(paragraph, expected_font)
     if current == expected_font:
         return None
     return _violation(_location(index), text, problem, current or "未设置", expected)
 
 
 def _size_violation(index: int, paragraph, text: str, problem: str, expected_pt: float, expected: str) -> Violation | None:
-    current = _first_run_size_pt(paragraph)
+    current = _best_run_size_pt(paragraph, expected_pt)
     if current is not None and abs(current - expected_pt) <= PT_TOLERANCE:
         return None
     return _violation(_location(index), text, problem, _format_pt(current), expected)
 
 
 def _bold_violation(index: int, paragraph, text: str, problem: str, expected_bold: bool, expected: str) -> Violation | None:
-    current = _first_run_bold(paragraph)
+    current = _best_run_bold(paragraph)
     if current is expected_bold:
         return None
     return _violation(_location(index), text, problem, "未加粗" if not current else "加粗", expected)
@@ -188,35 +197,79 @@ def _indent_violation(index: int, paragraph, text: str, expected: str) -> Violat
 
 
 def _is_heading(text: str) -> bool:
-    prefix = text.split("□", 1)[0]
-    return prefix.replace(".", "").isdigit() and len(prefix) <= 9
+    return bool(HEADING_PATTERN.match(text))
 
 
 def _is_body_text(text: str) -> bool:
-    return not text.startswith(("参考文献说明", "（", "(", "……", "..."))
+    if len(text) < BODY_MIN_TEXT_LENGTH:
+        return False
+    if text.startswith(("参考文献说明", "（", "(", "……", "...")):
+        return False
+    return text.endswith(("。", "；", "：", ".", ";", ":"))
 
 
 def _is_figure_or_table_title(text: str) -> bool:
     return text.startswith(("图", "表")) and "□" in text
 
 
-def _first_run_font(paragraph) -> str | None:
-    run = _first_text_run(paragraph)
+def _starts_body_section(text: str) -> bool:
+    return bool(re.match(r"^1(?:□|\s+)绪论", text))
+
+
+def _is_toc_paragraph(paragraph) -> bool:
+    style = paragraph.style.name if paragraph.style else ""
+    return style.lower().startswith("toc")
+
+
+def _heading_level(text: str) -> int:
+    marker = re.match(r"^(\d+(?:\.\d+){0,3})", text)
+    if not marker:
+        return 3
+    return marker.group(1).count(".") + 1
+
+
+def _normalized_label(text: str) -> str:
+    return text.replace("□", "").replace(" ", "")
+
+
+def _best_run_font(paragraph, expected_font: str) -> str | None:
+    run = _matching_font_run(paragraph, expected_font) or _first_text_run(paragraph)
     return run.font.name if run else None
 
 
-def _first_run_size_pt(paragraph) -> float | None:
-    run = _first_text_run(paragraph)
+def _best_run_size_pt(paragraph, expected_pt: float) -> float | None:
+    run = _matching_size_run(paragraph, expected_pt) or _first_text_run(paragraph)
     return run.font.size.pt if run and run.font.size else None
 
 
-def _first_run_bold(paragraph) -> bool | None:
-    run = _first_text_run(paragraph)
+def _best_run_bold(paragraph) -> bool | None:
+    run = _first_non_numeric_run(paragraph) or _first_text_run(paragraph)
     return run.bold if run else None
 
 
 def _first_text_run(paragraph):
     return next((run for run in paragraph.runs if run.text.strip()), None)
+
+
+def _first_non_numeric_run(paragraph):
+    return next((run for run in paragraph.runs if _has_non_numeric_text(run.text)), None)
+
+
+def _matching_font_run(paragraph, expected_font: str):
+    return next((run for run in paragraph.runs if run.font.name == expected_font), None)
+
+
+def _matching_size_run(paragraph, expected_pt: float):
+    return next((run for run in paragraph.runs if _run_size_matches(run, expected_pt)), None)
+
+
+def _run_size_matches(run, expected_pt: float) -> bool:
+    return bool(run.font.size and abs(run.font.size.pt - expected_pt) <= PT_TOLERANCE)
+
+
+def _has_non_numeric_text(text: str) -> bool:
+    stripped = text.strip().replace(".", "")
+    return bool(stripped) and not stripped.isdigit()
 
 
 def _format_pt(value: float | None) -> str:
